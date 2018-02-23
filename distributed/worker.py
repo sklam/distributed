@@ -76,6 +76,43 @@ READY = ('ready', 'constrained')
 _global_workers = []
 
 
+class GpuWrapper(object):
+    def __init__(self, obj):
+        self.obj = pickle.dumps(obj)
+
+    def load(self):
+        return pickle.loads(self.obj)
+
+
+def save_gpu(obj):
+    if hasattr(obj, '__dask_gpu_memory__'):
+        return GpuWrapper(obj)
+    else:
+        return obj
+
+
+def load_gpu(obj):
+    if isinstance(obj, GpuWrapper):
+        return obj.load()
+    else:
+        return obj
+
+
+def gpu_memory_used():
+    """Return info about GPU memory usage fraction
+    """
+    try:
+        from numba import cuda
+    except ImportError:
+        return 0
+
+    meminfo = cuda.current_context().get_memory_info()
+    total = meminfo.total
+    free = meminfo.free
+    used = total - free
+    return used / total
+
+
 class WorkerBase(ServerNode):
     def __init__(self, scheduler_ip=None, scheduler_port=None,
                  scheduler_file=None, ncores=None, loop=None, local_dir=None,
@@ -145,8 +182,9 @@ class WorkerBase(ServerNode):
                 raise ImportError("Please `pip install zict` for spill-to-disk workers")
             path = os.path.join(self.local_dir, 'storage')
             storage = Func(serialize_bytelist, deserialize_bytes, File(path))
+            intercept_gpu = Func(save_gpu, load_gpu, storage)
             target = int(float(self.memory_limit) * self.memory_target_fraction)
-            self.data = Buffer({}, storage, target, weight)
+            self.data = Buffer({}, intercept_gpu, target, weight)
         else:
             self.data = dict()
         self.loop = loop or IOLoop.current()
@@ -2210,12 +2248,27 @@ class Worker(WorkerBase):
             self.paused = False
             self.ensure_computing()
 
+        gpu_frac = gpu_memory_used()
+
+        # print("gpu target frac", self.memory_target_fraction)
+
         # Dump data to disk if above 70%
-        if self.memory_spill_fraction and frac > self.memory_spill_fraction:
+        # if self.memory_spill_fraction and frac > self.memory_spill_fraction:
+        if (self.memory_spill_fraction and (
+                frac > self.memory_spill_fraction or
+                gpu_frac > self.memory_spill_fraction)):
             target = self.memory_limit * self.memory_target_fraction
             count = 0
             need = memory - target
-            while memory > target:
+
+            # Count used memory
+            gpu_memory_size = sum([sys.getsizeof(v)
+                                   for v in self.data.fast.values()
+                                   if hasattr(v, '__dask_gpu_memory__')])
+
+            # print('Scanned', gpu_memory_size / 10 ** 6, 'MB')
+
+            while memory > target or gpu_frac > self.memory_target_fraction:
                 if not self.data.fast:
                     logger.warning("Memory use is high but worker has no data "
                                    "to store to disk.  Perhaps some other process "
@@ -2224,6 +2277,9 @@ class Worker(WorkerBase):
                                    format_bytes(proc.memory_info().rss),
                                    format_bytes(self.memory_limit))
                     break
+                print("gpu_memory evict",
+                        "used {:.2f}MB".format(gpu_memory_size / 10**6),
+                        "frac {:.1f}%".format(100 * gpu_frac))
                 k, v, weight = self.data.fast.evict()
                 del k, v
                 total += weight
@@ -2236,6 +2292,8 @@ class Worker(WorkerBase):
                     # before trying to evict even more data.
                     self._throttled_gc.collect()
                     memory = proc.memory_info().rss
+
+                gpu_frac = gpu_memory_used()
             if count:
                 logger.debug("Moved %d pieces of data data and %s to disk",
                              count, format_bytes(total))
